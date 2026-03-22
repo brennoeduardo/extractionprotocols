@@ -14,6 +14,7 @@ Dependência extra: pip install reportlab
 """
 
 import os
+import re
 import queue
 import shutil
 import threading
@@ -45,6 +46,12 @@ EXT_MOVER     = {".pdf"}
 EXT_CONVERTER = {".txt"}
 EXT_EXCEL     = {".xls", ".xlsx", ".xlsm", ".xlsb"}
 
+# O nome do arquivo (sem extensão) deve conter o padrão PROJETO(9)-NOTA(9)-PROTOCOLO(14)
+# e ter apenas dígitos e hífens (sem letras). Exemplos válidos:
+#   010204358-000003766-00006302460000
+#   20260329-010203963-000009521-00006470780000
+PADRAO_NOME = re.compile(r"^[\d-]*\d{9}-\d{9}-\d{14}[\d-]*$")
+
 
 # ────────────────────────────────────────────────────────────────────────────
 #  Utilitários
@@ -68,6 +75,23 @@ def gerar_nome_unico(destino: str) -> str:
     while os.path.exists(f"{base}_{i}{ext}"):
         i += 1
     return f"{base}_{i}{ext}"
+
+
+# Detecta prefixo de data no formato AAAAMMDD seguido de hífen
+# Exemplo: 20260329-010203963-... -> 2026-03-29-010203963-...
+_PREFIXO_DATA = re.compile(r"^(\d{4})(\d{2})(\d{2})-(.+)$")
+
+def formatar_nome(nome_sem_ext: str) -> tuple:
+    """
+    Retorna (nome_final, foi_renomeado).
+    Se o nome começa com uma data AAAAMMDD, formata para AAAA-MM-DD.
+    Caso contrário, devolve o nome sem alteração.
+    """
+    m = _PREFIXO_DATA.match(nome_sem_ext)
+    if m:
+        ano, mes, dia, resto = m.groups()
+        return f"{ano}-{mes}-{dia}-{resto}", True
+    return nome_sem_ext, False
 
 
 def txt_para_pdf(caminho_txt: str, caminho_pdf: str) -> None:
@@ -140,6 +164,7 @@ def processar_worker(
         "erros": 0,
         "excel": 0,
         "outros": 0,
+        "fora_padrao": 0,
         "subpastas": 0,
         "vazias": 0,
     }
@@ -177,6 +202,17 @@ def processar_worker(
             for item in itens:
                 caminho_item = os.path.join(pasta, item)
 
+                # ── Caso 0: Nome não segue o padrão → ignorar ─────────────
+                nome_sem_ext = Path(item).stem
+                if not os.path.isdir(caminho_item) and not PADRAO_NOME.match(nome_sem_ext):
+                    log(
+                        f"AVISO  | Nome fora do padrão em [{nome_pasta}] → [{item}] "
+                    )
+                    contadores["fora_padrao"] += 1
+                    itens_processados += 1
+                    fila_ui.put(("progresso", itens_processados / total_itens))
+                    continue
+
                 # ── Caso 1: É uma subpasta → ignorar ──────────────────────
                 if os.path.isdir(caminho_item):
                     log(
@@ -190,14 +226,20 @@ def processar_worker(
 
                 ext = Path(item).suffix.lower()
 
-                # ── Caso 2: PDF → mover ────────────────────────────────────
+                # ── Caso 2: PDF → mover (renomeando data se necessário) ───
                 if ext in EXT_MOVER:
-                    destino = gerar_nome_unico(os.path.join(pasta_destino, item))
+                    nome_formatado, tinha_data = formatar_nome(nome_sem_ext)
+                    nome_destino = nome_formatado + ext
+                    destino = gerar_nome_unico(os.path.join(pasta_destino, nome_destino))
                     try:
                         shutil.move(caminho_item, destino)
                         nome_final = os.path.basename(destino)
-                        sufixo = f" → renomeado para [{nome_final}]" if nome_final != item else ""
-                        log(f"OK     | PDF movido [{item}] de [{nome_pasta}]{sufixo}")
+                        if tinha_data:
+                            log(f"OK     | PDF movido [{item}] → [{nome_final}] (data formatada) de [{nome_pasta}]")
+                        elif nome_final != item:
+                            log(f"OK     | PDF movido [{item}] → [{nome_final}] de [{nome_pasta}]")
+                        else:
+                            log(f"OK     | PDF movido [{item}] de [{nome_pasta}]")
                         contadores["movidos"] += 1
                     except PermissionError:
                         log(f"ERRO   | Sem permissão para mover [{item}] em [{nome_pasta}]", "error")
@@ -208,7 +250,8 @@ def processar_worker(
 
                 # ── Caso 3: TXT → converter para PDF e mover ──────────────
                 elif ext in EXT_CONVERTER:
-                    nome_pdf = Path(item).stem + ".pdf"
+                    nome_formatado, tinha_data = formatar_nome(nome_sem_ext)
+                    nome_pdf = nome_formatado + ".pdf"
                     pdf_temp = os.path.join(pasta, nome_pdf)
                     destino  = gerar_nome_unico(os.path.join(pasta_destino, nome_pdf))
                     try:
@@ -216,7 +259,10 @@ def processar_worker(
                         shutil.move(pdf_temp, destino)
                         os.remove(caminho_item)
                         nome_final = os.path.basename(destino)
-                        log(f"OK     | TXT convertido [{item}] → [{nome_final}] de [{nome_pasta}]")
+                        if tinha_data:
+                            log(f"OK     | TXT convertido [{item}] → [{nome_final}] (data formatada) de [{nome_pasta}]")
+                        else:
+                            log(f"OK     | TXT convertido [{item}] → [{nome_final}] de [{nome_pasta}]")
                         contadores["convertidos"] += 1
                     except ImportError as e:
                         log(f"ERRO   | {e}", "error")
@@ -257,6 +303,7 @@ def processar_worker(
         log(f"PDFs movidos            : {contadores['movidos']}")
         log(f"TXTs convertidos→PDF    : {contadores['convertidos']}")
         log(f"Erros                   : {contadores['erros']}")
+        log(f"Fora do padrão de nome  : {contadores['fora_padrao']}")
         log(f"Excels ignorados        : {contadores['excel']}")
         log(f"Outros tipos ignorados  : {contadores['outros']}")
         log(f"Subpastas ignoradas     : {contadores['subpastas']}")
@@ -341,19 +388,6 @@ class App(ctk.CTk):
             command=self._selecionar_destino,
         ).pack(side="left")
 
-        # Legenda de regras
-        frame_regras = ctk.CTkFrame(self)
-        frame_regras.pack(fill="x", **pad, pady=4)
-        regras = (
-            "Regras:  ✔ PDF → move    "
-            "✔ TXT → converte para PDF e move    "
-            "✖ Excel → ignora    "
-            "✖ Subpasta → ignora    "
-            "✖ Outros → ignora"
-        )
-        ctk.CTkLabel(frame_regras, text=regras, font=("", 11),
-                     text_color="gray").pack(padx=8, pady=6)
-
         # Progresso
         frame_prog = ctk.CTkFrame(self)
         frame_prog.pack(fill="x", **pad, pady=4)
@@ -430,12 +464,6 @@ class App(ctk.CTk):
             f"Serão processados {total} arquivo(s) encontrados nas subpastas de:\n\n"
             f"  {self.pasta_raiz}\n\n"
             f"Destino: {self.pasta_destino}\n\n"
-            "Regras aplicadas:\n"
-            "  • PDF       → movido\n"
-            "  • TXT       → convertido para PDF e movido\n"
-            "  • Excel     → ignorado\n"
-            "  • Subpasta  → ignorada\n"
-            "  • Outros    → ignorados\n\n"
             "Esta operação NÃO pode ser desfeita. Continuar?",
         )
         if not confirmado:
@@ -513,6 +541,8 @@ class App(ctk.CTk):
             self.logger.handlers.clear()
 
         avisos = []
+        if c["fora_padrao"]:
+            avisos.append(f"⚠ {c['fora_padrao']} arquivo(s) com nome fora do padrão ignorado(s)")
         if c["subpastas"]:
             avisos.append(f"⚠ {c['subpastas']} subpasta(s) ignorada(s) nos protocolos")
         if c["excel"]:
@@ -524,7 +554,6 @@ class App(ctk.CTk):
 
         corpo = (
             f"✔ {c['movidos']} PDF(s) movido(s)\n"
-            f"✔ {c['convertidos']} TXT(s) convertido(s) para PDF\n"
             f"✖ {c['erros']} erro(s)\n"
         )
         if avisos:
