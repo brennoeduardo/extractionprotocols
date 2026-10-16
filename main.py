@@ -9,8 +9,13 @@ Regras de negócio:
       .xls / .xlsx    → ignorado com aviso (Excel não é esperado)
       subpasta        → ignorada com aviso (sinal de algo errado)
       qualquer outro  → ignorado com aviso
+  - Após a extração (opcional, ligado por padrão), separa os PDFs da pasta de
+    destino por banco do projeto (Formulário 18):
+      341 → "341 - ITAU" | 001 → "001 - BB" | 104 → "104 - CAIXA"
+      remove a data da frente (AAAA-MM-DD-) e/ou o tracinho inicial do nome;
+      filial 010100001 recebe o vencimento (VENC:) na frente se vencer a partir de amanhã.
 
-Dependência extra: pip install reportlab
+Dependências extras: pip install reportlab pypdf
 """
 
 import os
@@ -19,7 +24,7 @@ import queue
 import shutil
 import threading
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import customtkinter as ctk
@@ -34,6 +39,12 @@ try:
     REPORTLAB_OK = True
 except ImportError:
     REPORTLAB_OK = False
+
+try:
+    from pypdf import PdfReader
+    PYPDF_OK = True
+except ImportError:
+    PYPDF_OK = False
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
@@ -51,6 +62,13 @@ EXT_EXCEL     = {".xls", ".xlsx", ".xlsm", ".xlsb"}
 #   010204358-000003766-00006302460000
 #   20260329-010203963-000009521-00006470780000
 PADRAO_NOME = re.compile(r"^[\d-]*\d{9}-\d{9}-\d{14}[\d-]*$")
+
+# Separação por banco do projeto (Formulário 18)
+BANCOS = {"341": "341 - ITAU", "001": "001 - BB", "104": "104 - CAIXA"}
+FILIAL_COM_VENCIMENTO = "010100001"
+_PADRAO_BANCO = re.compile(r"BANCO DO PROJETO:\s*(\d+)")
+_PADRAO_VENC  = re.compile(r"VENC:\s*(\d{2})/(\d{2})/(\d{4})")
+_PREFIXO_DATA_FORMATADA = re.compile(r"^(\d{4}-\d{2}-\d{2})?-")
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -131,6 +149,73 @@ def txt_para_pdf(caminho_txt: str, caminho_pdf: str) -> None:
     doc.build(elementos)
 
 
+def ler_formulario_18(caminho_pdf: str) -> tuple:
+    """Retorna (banco, vencimento 'AAAA-MM-DD' ou None) lidos do Formulário 18."""
+    for pagina in PdfReader(caminho_pdf).pages:
+        texto = pagina.extract_text() or ""
+        banco = _PADRAO_BANCO.search(texto)
+        if banco:
+            venc = _PADRAO_VENC.search(texto)
+            vencimento = f"{venc.group(3)}-{venc.group(2)}-{venc.group(1)}" if venc else None
+            return banco.group(1), vencimento
+    return None, None
+
+
+def separar_por_banco(pasta: str, log, contadores: dict) -> None:
+    """
+    Move os PDFs soltos em `pasta` para a subpasta do banco do projeto.
+    Remove a data da frente e/ou o tracinho inicial; a filial 010100001 recebe o
+    vencimento na frente se vencer a partir de amanhã. Nunca sobrescreve arquivos.
+    """
+    log("─── SEPARAÇÃO POR BANCO ─────────────────────────")
+    if not PYPDF_OK:
+        log("ERRO   | pypdf não está instalado — separação por banco não executada", "error")
+        contadores["erros"] += 1
+        return
+
+    hoje = date.today().isoformat()
+    for arquivo in sorted(os.listdir(pasta)):
+        origem = os.path.join(pasta, arquivo)
+        if not (os.path.isfile(origem) and arquivo.lower().endswith(".pdf")):
+            continue
+
+        try:
+            banco, vencimento = ler_formulario_18(origem)
+        except Exception as e:
+            log(f"AVISO  | Não foi possível ler [{arquivo}] — {e} (não separado)")
+            contadores["nao_separados"] += 1
+            continue
+
+        if banco not in BANCOS:
+            motivo = "Formulário 18 não encontrado" if banco is None else f"banco {banco} sem pasta definida"
+            log(f"AVISO  | [{arquivo}] {motivo} (não separado)")
+            contadores["nao_separados"] += 1
+            continue
+
+        novo_nome = _PREFIXO_DATA_FORMATADA.sub("", arquivo)
+        if novo_nome.startswith(FILIAL_COM_VENCIMENTO):
+            if vencimento is None:
+                log(f"AVISO  | [{arquivo}] filial {FILIAL_COM_VENCIMENTO} sem VENC no Formulário 18 (separado sem data)")
+            elif vencimento > hoje:
+                novo_nome = f"{vencimento}-{novo_nome}"
+
+        pasta_banco = os.path.join(pasta, BANCOS[banco])
+        destino = os.path.join(pasta_banco, novo_nome)
+        if os.path.exists(destino):
+            log(f"AVISO  | Já existe [{novo_nome}] em [{BANCOS[banco]}] — [{arquivo}] não separado")
+            contadores["nao_separados"] += 1
+            continue
+
+        try:
+            os.makedirs(pasta_banco, exist_ok=True)
+            shutil.move(origem, destino)
+            log(f"OK     | [{BANCOS[banco]}] {arquivo} → {novo_nome}")
+            contadores["separados"] += 1
+        except OSError as e:
+            log(f"ERRO   | Falha ao separar [{arquivo}] — {e}", "error")
+            contadores["erros"] += 1
+
+
 def contar_arquivos_protocolo(pasta_raiz: str) -> int:
     """Conta apenas arquivos diretos dentro das subpastas de primeiro nível."""
     total = 0
@@ -156,17 +241,19 @@ def processar_worker(
     pasta_destino: str,
     fila_ui: queue.Queue,
     logger: logging.Logger,
+    separar_bancos: bool = True,
 ) -> None:
 
     contadores = {
         "movidos": 0,
-        "convertidos": 0,
         "erros": 0,
-        "excel": 0,
-        "outros": 0,
         "fora_padrao": 0,
-        "subpastas": 0,
         "vazias": 0,
+        "pastas_removidas": 0,
+        "subpastas": 0,
+        "outros": 0,
+        "separados": 0,
+        "nao_separados": 0,
     }
 
     def log(msg: str, nivel: str = "info") -> None:
@@ -195,9 +282,12 @@ def processar_worker(
             itens = sorted(os.listdir(pasta))
 
             if not itens:
-                log(f"AVISO  | Pasta vazia → [{nome_pasta}]")
+                log(f"AVISO  | Pasta vazia ignorada → [{nome_pasta}]")
                 contadores["vazias"] += 1
                 continue
+
+            # Flag por pasta: False se qualquer item falhar ou for ignorado
+            teve_documento_processado  = False
 
             for item in itens:
                 caminho_item = os.path.join(pasta, item)
@@ -207,6 +297,7 @@ def processar_worker(
                 if not os.path.isdir(caminho_item) and not PADRAO_NOME.match(nome_sem_ext):
                     log(
                         f"AVISO  | Nome fora do padrão em [{nome_pasta}] → [{item}] "
+                        f"(esperado: 9dígitos-9dígitos-14dígitos)"
                     )
                     contadores["fora_padrao"] += 1
                     itens_processados += 1
@@ -234,13 +325,17 @@ def processar_worker(
                     try:
                         shutil.move(caminho_item, destino)
                         nome_final = os.path.basename(destino)
+
                         if tinha_data:
                             log(f"OK     | PDF movido [{item}] → [{nome_final}] (data formatada) de [{nome_pasta}]")
                         elif nome_final != item:
                             log(f"OK     | PDF movido [{item}] → [{nome_final}] de [{nome_pasta}]")
                         else:
                             log(f"OK     | PDF movido [{item}] de [{nome_pasta}]")
+
                         contadores["movidos"] += 1
+                        teve_documento_processado = True
+
                     except PermissionError:
                         log(f"ERRO   | Sem permissão para mover [{item}] em [{nome_pasta}]", "error")
                         contadores["erros"] += 1
@@ -250,30 +345,11 @@ def processar_worker(
 
                 # ── Caso 3: TXT → converter para PDF e mover ──────────────
                 elif ext in EXT_CONVERTER:
-                    nome_formatado, tinha_data = formatar_nome(nome_sem_ext)
-                    nome_pdf = nome_formatado + ".pdf"
-                    pdf_temp = os.path.join(pasta, nome_pdf)
-                    destino  = gerar_nome_unico(os.path.join(pasta_destino, nome_pdf))
                     try:
-                        txt_para_pdf(caminho_item, pdf_temp)
-                        shutil.move(pdf_temp, destino)
                         os.remove(caminho_item)
-                        nome_final = os.path.basename(destino)
-                        if tinha_data:
-                            log(f"OK     | TXT convertido [{item}] → [{nome_final}] (data formatada) de [{nome_pasta}]")
-                        else:
-                            log(f"OK     | TXT convertido [{item}] → [{nome_final}] de [{nome_pasta}]")
-                        contadores["convertidos"] += 1
-                    except ImportError as e:
-                        log(f"ERRO   | {e}", "error")
-                        contadores["erros"] += 1
+                        log(f"OK     | TXT ignorado e excluído [{item}] de [{nome_pasta}]")
                     except Exception as e:
-                        log(f"ERRO   | Falha ao converter TXT [{item}] — {e}", "error")
-                        if os.path.exists(pdf_temp):
-                            try:
-                                os.remove(pdf_temp)
-                            except OSError:
-                                pass
+                        log(f"ERRO   | Falha ao excluir TXT [{item}] — {e}", "error")
                         contadores["erros"] += 1
 
                 # ── Caso 4: Excel → ignorar com aviso ─────────────────────
@@ -282,7 +358,6 @@ def processar_worker(
                         f"AVISO  | Excel ignorado em [{nome_pasta}] → [{item}] "
                         f"(somente PDF e TXT são processados)"
                     )
-                    contadores["excel"] += 1
 
                 # ── Caso 5: Qualquer outro tipo → ignorar ──────────────────
                 else:
@@ -291,9 +366,36 @@ def processar_worker(
                         f"[{nome_pasta}] → [{item}]"
                     )
                     contadores["outros"] += 1
-
                 itens_processados += 1
                 fila_ui.put(("progresso", itens_processados / total_itens))
+
+            # Remove a pasta apenas se todos os itens foram processados com sucesso
+
+            # Se pelo menos 1 documento válido foi processado, apaga o restante da pasta
+            if teve_documento_processado:
+                try:
+                    for restante in os.listdir(pasta):
+                        caminho_restante = os.path.join(pasta, restante)
+
+                        if os.path.isfile(caminho_restante):
+                            os.remove(caminho_restante)
+                            log(f"OK     | Arquivo restante excluído → [{restante}] de [{nome_pasta}]")
+                        elif os.path.isdir(caminho_restante):
+                            shutil.rmtree(caminho_restante)
+                            log(f"OK     | Subpasta restante excluída → [{restante}] de [{nome_pasta}]")
+
+                    os.rmdir(pasta)
+                    log(f"OK     | Pasta removida → [{nome_pasta}]")
+                    contadores["pastas_removidas"] += 1
+
+                except OSError as e:
+                    log(f"ERRO   | Não foi possível limpar/remover [{nome_pasta}] — {e}", "error")
+                    contadores["erros"] += 1
+            else:
+                log(f"AVISO  | Pasta mantida → [{nome_pasta}] (nenhum documento válido foi processado)")
+
+        if separar_bancos:
+            separar_por_banco(pasta_destino, log, contadores)
 
     except Exception as e:
         log(f"ERRO CRÍTICO: {e}", "critical")
@@ -301,13 +403,13 @@ def processar_worker(
     finally:
         log("─── RESUMO ──────────────────────────────────────")
         log(f"PDFs movidos            : {contadores['movidos']}")
-        log(f"TXTs convertidos→PDF    : {contadores['convertidos']}")
         log(f"Erros                   : {contadores['erros']}")
         log(f"Fora do padrão de nome  : {contadores['fora_padrao']}")
-        log(f"Excels ignorados        : {contadores['excel']}")
-        log(f"Outros tipos ignorados  : {contadores['outros']}")
-        log(f"Subpastas ignoradas     : {contadores['subpastas']}")
         log(f"Pastas protocolo vazias : {contadores['vazias']}")
+        log(f"Pastas removidas        : {contadores['pastas_removidas']}")
+        if separar_bancos:
+            log(f"Separados por banco     : {contadores['separados']}")
+            log(f"Não separados           : {contadores['nao_separados']}")
         fila_ui.put(("concluido", contadores))
 
 
@@ -320,7 +422,7 @@ class App(ctk.CTk):
         super().__init__()
 
         self.title("Extrator de Protocolos Financeiros")
-        self.geometry("740x580")
+        self.geometry("740x620")
         self.resizable(False, False)
 
         self.pasta_raiz    = ""
@@ -387,6 +489,14 @@ class App(ctk.CTk):
             width=150, height=34,
             command=self._selecionar_destino,
         ).pack(side="left")
+
+        # ── Separação por banco ─────────────────────────────────────────
+        self.var_separar = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            self,
+            text="Separar por banco após extrair (341 ITAU / 001 BB / 104 CAIXA)",
+            variable=self.var_separar,
+        ).pack(anchor="w", **pad, pady=4)
 
         # Progresso
         frame_prog = ctk.CTkFrame(self)
@@ -462,7 +572,7 @@ class App(ctk.CTk):
         confirmado = messagebox.askyesno(
             "Confirmar processamento",
             f"Serão processados {total} arquivo(s) encontrados nas subpastas de:\n\n"
-            f"  {self.pasta_raiz}\n\n"
+            f"Origem: {self.pasta_raiz}\n\n"
             f"Destino: {self.pasta_destino}\n\n"
             "Esta operação NÃO pode ser desfeita. Continuar?",
         )
@@ -486,7 +596,8 @@ class App(ctk.CTk):
 
         thread = threading.Thread(
             target=processar_worker,
-            args=(self.pasta_raiz, self.pasta_destino, self.fila_ui, self.logger),
+            args=(self.pasta_raiz, self.pasta_destino, self.fila_ui, self.logger,
+                  self.var_separar.get()),
             daemon=True,
         )
         thread.start()
@@ -545,17 +656,20 @@ class App(ctk.CTk):
             avisos.append(f"⚠ {c['fora_padrao']} arquivo(s) com nome fora do padrão ignorado(s)")
         if c["subpastas"]:
             avisos.append(f"⚠ {c['subpastas']} subpasta(s) ignorada(s) nos protocolos")
-        if c["excel"]:
-            avisos.append(f"⚠ {c['excel']} Excel(s) ignorado(s)")
         if c["outros"]:
             avisos.append(f"⚠ {c['outros']} arquivo(s) de outro tipo ignorado(s)")
         if c["vazias"]:
             avisos.append(f"⚠ {c['vazias']} pasta(s) protocolo vazia(s)")
+        if c["nao_separados"]:
+            avisos.append(f"⚠ {c['nao_separados']} PDF(s) não separado(s) por banco (ficaram na pasta de destino)")
 
         corpo = (
             f"✔ {c['movidos']} PDF(s) movido(s)\n"
-            f"✖ {c['erros']} erro(s)\n"
+            f"✔ {c['pastas_removidas']} pasta(s) protocolo removida(s)\n"
         )
+        if c["separados"]:
+            corpo += f"✔ {c['separados']} PDF(s) separado(s) por banco\n"
+        corpo += f"✖ {c['erros']} erro(s)\n"
         if avisos:
             corpo += "\n" + "\n".join(avisos)
         corpo += "\n\nConsulte log_processamento.txt para detalhes."
